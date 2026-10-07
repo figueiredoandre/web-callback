@@ -1,0 +1,130 @@
+# -----------------------------------------------------------------------------
+# CI - Web Callback (Ponte OIDC)
+# Mesmo fluxo do backend-cloud:
+#   WAR no OCI Artifact Registry -> build da imagem -> push no OCIR (gru.ocir.io)
+#   -> você altera o newTag no k8s-gitops -> ArgoCD sincroniza.
+#
+# Disparo: push de tag  v<versão-do-war>-r<revisão-da-imagem>   ex.: v1.0.0-r2
+#   - versão do WAR  = 1.0.0  (sequência da TEC / Nexus)
+#   - revisão         = 2      (muda quando só Dockerfile/Tomcat mudam)
+#   - tag da imagem   = 1.0.0-r2  (imutável; nunca "latest")
+# Ou manualmente em Actions > ci > Run workflow.
+#
+# Secrets (reaproveite os do backend-cloud):
+#   OCI_CLI_USER, OCI_CLI_TENANCY, OCI_CLI_FINGERPRINT, OCI_CLI_KEY_CONTENT
+#   OCIR_USERNAME (ex.: oracleidentitycloudservice/usuario), OCIR_AUTH_TOKEN
+# Variables:
+#   OCIR_NAMESPACE (namespace do Object Storage), WAR_REPOSITORY_OCID
+# -----------------------------------------------------------------------------
+name: ci
+
+on:
+  push:
+    tags: ["v*.*.*-r*"]
+  workflow_dispatch:
+    inputs:
+      app_version:   { description: "Versão do WAR (ex.: 1.0.0)", required: true }
+      image_revision: { description: "Revisão da imagem (ex.: 2)", required: true, default: "1" }
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  OCI_CLI_REGION: sa-saopaulo-1
+  OCIR_HOST: gru.ocir.io
+  IMAGE_NAME: web-callback
+  WAR_ARTIFACT_PATH: web-callback.war
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolver versões
+        id: v
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME#v}"                       # 1.0.0-r2
+          else
+            TAG="${{ inputs.app_version }}-r${{ inputs.image_revision }}"
+          fi
+          APP="${TAG%-r*}"; REV="${TAG##*-r}"
+          [[ "$APP" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$REV" =~ ^[0-9]+$ ]] || { echo "Tag inválida: $TAG"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"; echo "app=$APP" >> "$GITHUB_OUTPUT"; echo "rev=$REV" >> "$GITHUB_OUTPUT"
+          echo "image=${OCIR_HOST}/${{ vars.OCIR_NAMESPACE }}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Instalar OCI CLI
+        run: pip install --quiet oci-cli
+
+      - name: Baixar WAR do OCI Artifact Registry
+        env:
+          OCI_CLI_USER:        ${{ secrets.OCI_CLI_USER }}
+          OCI_CLI_TENANCY:     ${{ secrets.OCI_CLI_TENANCY }}
+          OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+          OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+        run: |
+          mkdir -p artifacts
+          oci artifacts generic artifact download-by-path \
+            --repository-id "${{ vars.WAR_REPOSITORY_OCID }}" \
+            --artifact-path "${WAR_ARTIFACT_PATH}" \
+            --artifact-version "${{ steps.v.outputs.app }}" \
+            --file "artifacts/web-callback-${{ steps.v.outputs.app }}.war"
+          # sanidade: é um WAR com as libs esperadas?
+          unzip -l "artifacts/web-callback-${{ steps.v.outputs.app }}.war" \
+            | grep -E "WEB-INF/lib/(jedis|nimbus-jose-jwt|bcprov|bcpkix)" \
+            || { echo "WAR sem as dependências esperadas"; exit 1; }
+          sha256sum artifacts/*.war
+
+      - name: Login no OCIR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.OCIR_HOST }}
+          username: ${{ vars.OCIR_NAMESPACE }}/${{ secrets.OCIR_USERNAME }}
+          password: ${{ secrets.OCIR_AUTH_TOKEN }}
+
+      - name: Impedir sobrescrever tag existente (imagem imutável)
+        run: |
+          if docker manifest inspect "${{ steps.v.outputs.image }}:${{ steps.v.outputs.tag }}" >/dev/null 2>&1; then
+            echo "A tag ${{ steps.v.outputs.tag }} já existe no OCIR. Use uma nova revisão (-rN)."; exit 1
+          fi
+
+      - name: Build
+        run: |
+          docker build \
+            -f docker/Dockerfile \
+            --build-arg APP_VERSION=${{ steps.v.outputs.app }} \
+            --build-arg IMAGE_REVISION=${{ steps.v.outputs.rev }} \
+            --label org.opencontainers.image.revision=${GITHUB_SHA} \
+            --label org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY} \
+            -t "${{ steps.v.outputs.image }}:${{ steps.v.outputs.tag }}" .
+
+      # Opcional (recomendado): scan de vulnerabilidades. Fixe a versão do Trivy.
+      # - name: Scan (Trivy)
+      #   run: |
+      #     docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:<versão> \
+      #       image --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed \
+      #       "${{ steps.v.outputs.image }}:${{ steps.v.outputs.tag }}"
+
+      - name: Push
+        id: push
+        run: |
+          docker push "${{ steps.v.outputs.image }}:${{ steps.v.outputs.tag }}"
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${{ steps.v.outputs.image }}:${{ steps.v.outputs.tag }}")
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Resumo (próximo passo no k8s-gitops)
+        run: |
+          {
+            echo "### Imagem publicada"
+            echo "- Tag: \`${{ steps.v.outputs.image }}:${{ steps.v.outputs.tag }}\`"
+            echo "- Digest: \`${{ steps.push.outputs.digest }}\`"
+            echo ""
+            echo "Próximo passo: em \`k8s-gitops/apps/web-callback/kustomization.yaml\` altere"
+            echo "\`newTag: \"${{ steps.v.outputs.tag }}\"\` e faça push na main (ArgoCD sincroniza)."
+          } >> "$GITHUB_STEP_SUMMARY"

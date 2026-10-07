@@ -1,0 +1,35 @@
+# -----------------------------------------------------------------------------
+# Overlay OPCIONAL: Redis com TLS (simula REDIS_SSL=true exigido em produção)
+#   ./tls/gen-redis-tls.sh
+#   docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d
+# -----------------------------------------------------------------------------
+services:
+  redis:
+    command: >
+      sh -c 'exec redis-server
+      --requirepass "$$REDIS_PASSWORD"
+      --port 0
+      --tls-port 6379
+      --tls-cert-file /tls/redis.crt
+      --tls-key-file /tls/redis.key
+      --tls-ca-cert-file /tls/ca.crt
+      --tls-auth-clients no
+      --save ""
+      --appendonly no
+      --maxmemory 256mb
+      --maxmemory-policy noeviction'
+    volumes:
+      - ./tls/certs:/tls:ro
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --tls --cacert /tls/ca.crt --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+
+  web-callback:
+    environment:
+      REDIS_SSL: "true"
+      # JAVA_OPTS (e não CATALINA_OPTS) para não sobrescrever as flags de memória do Dockerfile
+      JAVA_OPTS: >-
+        -Djavax.net.ssl.trustStore=/tls/truststore.p12
+        -Djavax.net.ssl.trustStoreType=PKCS12
+        -Djavax.net.ssl.trustStorePassword=changeit
+    volumes:
+      - ./tls/certs/truststore.p12:/tls/truststore.p12:ro

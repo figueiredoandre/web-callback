@@ -1,0 +1,136 @@
+# -----------------------------------------------------------------------------
+# Web Callback + Redis - ambiente de VALIDAÇÃO em servidor Linux (Fase 1)
+#   docker compose up -d --build
+# -----------------------------------------------------------------------------
+name: web-callback
+
+services:
+
+  redis:
+    image: ${REDIS_IMAGE:-redis:7.4-alpine}
+    container_name: wcb-redis
+    restart: unless-stopped
+    user: "999:1000"           # usuário "redis" da imagem oficial (não-root)
+    # Senha via env (não aparece no Dockerfile/imagem). Sem persistência em disco:
+    # os dados são transações com TTL curto + contadores de rate limit.
+    # noeviction: com memória cheia o Redis RECUSA escrita (erro visível) em vez de
+    # descartar transações em voo silenciosamente.
+    command: >
+      sh -c 'exec redis-server
+      --requirepass "$$REDIS_PASSWORD"
+      --save ""
+      --appendonly no
+      --maxmemory 256mb
+      --maxmemory-policy noeviction
+      --protected-mode yes'
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?defina REDIS_PASSWORD no .env}
+    # Sem "ports": o Redis NÃO é exposto no host, só na rede interna.
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    read_only: true
+    tmpfs: [/data]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    mem_limit: 384m
+    cpus: 0.5
+
+  web-callback:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        APP_VERSION: ${APP_VERSION:-1.0.0}
+        IMAGE_REVISION: ${IMAGE_REVISION:-2}
+        BUILD_IMAGE: ${BUILD_IMAGE:-tomcat:10.1-jdk25-temurin}
+        RUNTIME_IMAGE: ${RUNTIME_IMAGE:-tomcat:10.1-jre25-temurin}
+    image: web-callback:${APP_VERSION:-1.0.0}-r${IMAGE_REVISION:-2}
+    container_name: wcb-app
+    restart: unless-stopped
+    # A app faz PING no Redis no boot (fail-fast): só sobe depois do Redis saudável.
+    depends_on:
+      redis:
+        condition: service_healthy
+    # Tomcat NÃO é publicado para fora: só o proxy (rede interna) e o próprio servidor
+    # (127.0.0.1, útil para os scripts de teste). Acesso externo é só via HTTPS no proxy.
+    ports:
+      - "127.0.0.1:${HOST_HTTP_PORT:-8080}:8080"
+    networks: [backend]
+    # Filesystem somente-leitura: só work/, temp/ e logs/ são graváveis (em memória).
+    # Se algo quebrar por escrita em disco, o log mostra "Read-only file system":
+    # comente read_only para confirmar e avise para mapearmos o diretório.
+    read_only: true
+    tmpfs:
+      - /usr/local/tomcat/work:size=64m,mode=1777
+      - /usr/local/tomcat/temp:size=64m,mode=1777
+      - /usr/local/tomcat/logs:size=16m,mode=1777
+    environment:
+      REDIS_HOST: redis                      # nome do serviço = DNS interno do Docker
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?defina REDIS_PASSWORD no .env}
+      REDIS_SSL: ${REDIS_SSL:-false}
+      REDIS_TIMEOUT_MS: ${REDIS_TIMEOUT_MS:-2000}
+      BRIDGE_REDIS_MAX_TOTAL: ${BRIDGE_REDIS_MAX_TOTAL:-10}
+      BRIDGE_REDIS_MAX_WAIT_MS: ${BRIDGE_REDIS_MAX_WAIT_MS:-1000}
+      BRIDGE_TRANSACTION_STORE: ${BRIDGE_TRANSACTION_STORE:-redis}
+      BRIDGE_TRANSACTION_KEY_PREFIX: ${BRIDGE_TRANSACTION_KEY_PREFIX:-iwlcb:txn:}
+      BRIDGE_TRANSACTION_TTL_SECONDS: ${BRIDGE_TRANSACTION_TTL_SECONDS:-60}
+      BRIDGE_PLATFORM_ENV: ${BRIDGE_PLATFORM_ENV:-HOMOLOGATION}
+      BRIDGE_PLATFORM_URL: ${BRIDGE_PLATFORM_URL:-}
+      BRIDGE_PLATFORM_CONNECT_TIMEOUT_MS: ${BRIDGE_PLATFORM_CONNECT_TIMEOUT_MS:-2000}
+      BRIDGE_PLATFORM_READ_TIMEOUT_MS: ${BRIDGE_PLATFORM_READ_TIMEOUT_MS:-3000}
+      BRIDGE_ALLOWED_RETURN_SCHEME: ${BRIDGE_ALLOWED_RETURN_SCHEME:-https}
+      BRIDGE_RATE_LIMIT_PER_MINUTE: ${BRIDGE_RATE_LIMIT_PER_MINUTE:-300}
+      BRIDGE_RATE_LIMIT_BURST: ${BRIDGE_RATE_LIMIT_BURST:-50}
+      BRIDGE_HEALTH_VERBOSE: ${BRIDGE_HEALTH_VERBOSE:-false}
+      TZ: America/Sao_Paulo
+    # Limite do container -> JVM usa MaxRAMPercentage=70 (~716 MB de heap máx.)
+    mem_limit: 1g
+    cpus: 1.0
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    # Tomcat recebe SIGTERM e faz shutdown ordenado
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }
+
+  proxy:
+    image: ${PROXY_IMAGE:-nginxinc/nginx-unprivileged:stable-alpine}
+    container_name: wcb-proxy
+    restart: unless-stopped
+    depends_on:
+      web-callback:
+        condition: service_healthy
+    ports:
+      - "${HOST_HTTP_PORT_PUBLIC:-80}:8080"
+      - "${HOST_HTTPS_PORT:-443}:8443"
+    networks: [backend]
+    volumes:
+      - ./docker/nginx/web-callback.conf:/etc/nginx/conf.d/default.conf:ro
+      # Mesmo formato de um Secret kubernetes.io/tls (tls.crt / tls.key)
+      - ${TLS_CERT_DIR:-./certs}:/etc/nginx/tls:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    mem_limit: 128m
+    cpus: 0.5
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null --no-check-certificate https://127.0.0.1:8443/nginx-health || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }
+
+networks:
+  backend:
+    name: wcb-backend
+    driver: bridge

@@ -1,0 +1,5 @@
+.env
+artifacts/*.war
+tls/certs/
+certs/*
+!certs/README.md

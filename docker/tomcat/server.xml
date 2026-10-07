@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  server.xml enxuto para container (Web Callback / Tomcat 10.1)
+  Removido em relação ao padrão da imagem:
+    - porta de shutdown 8005 (port="-1"): o container para via SIGTERM
+    - AprLifecycleListener (TLS fica no proxy/ingress; elimina o aviso de "restricted method")
+    - GlobalNamingResources / UserDatabase / LockOutRealm (sem manager, sem tomcat-users)
+    - AccessLogValve em arquivo (o access log fica no proxy/ingress)
+-->
+<Server port="-1" shutdown="SHUTDOWN">
+  <!-- logArgs=false: não imprime JAVA_OPTS/CATALINA_OPTS no log (podem conter senhas de truststore) -->
+  <Listener className="org.apache.catalina.startup.VersionLoggerListener" logArgs="false" />
+  <Listener className="org.apache.catalina.core.JreMemoryLeakPreventionListener" />
+  <Listener className="org.apache.catalina.core.ThreadLocalLeakPreventionListener" />
+
+  <Service name="Catalina">
+    <!-- Só HTTP interno: TLS termina no proxy (Docker) / Ingress (Kubernetes) -->
+    <Connector port="8080" protocol="HTTP/1.1"
+               connectionTimeout="20000"
+               keepAliveTimeout="30000"
+               maxThreads="200" minSpareThreads="10" acceptCount="100"
+               maxHttpHeaderSize="8192"
+               maxPostSize="65536" maxSwallowSize="65536"
+               allowTrace="false" xpoweredBy="false"
+               URIEncoding="UTF-8" />
+
+    <Engine name="Catalina" defaultHost="localhost">
+      <!-- Confia no X-Forwarded-For/Proto vindo do proxy (faixas privadas: rede Docker / pods K8s).
+           Assim request.isSecure()/getScheme() refletem https e o IP real do cliente. -->
+      <Valve className="org.apache.catalina.valves.RemoteIpValve"
+             remoteIpHeader="X-Forwarded-For"
+             protocolHeader="X-Forwarded-Proto"
+             protocolHeaderHttpsValue="https" />
+
+      <!-- WAR já vem expandido na imagem: nada de unpack/autoDeploy em runtime (permite FS read-only) -->
+      <Host name="localhost" appBase="webapps"
+            unpackWARs="false" autoDeploy="false" deployOnStartup="true">
+        <!-- Páginas de erro sem stack trace e SEM versão do Tomcat -->
+        <Valve className="org.apache.catalina.valves.ErrorReportValve"
+               showReport="false" showServerInfo="false" />
+      </Host>
+    </Engine>
+  </Service>
+</Server>
