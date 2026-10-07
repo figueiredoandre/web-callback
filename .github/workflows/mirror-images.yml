@@ -32,6 +32,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Conferir secrets e variables
+        env:
+          S_USER:  ${{ secrets.OCIR_USERNAME }}
+          S_TOKEN: ${{ secrets.OCIR_AUTH_TOKEN }}
+          V_NS:    ${{ vars.OCIR_NAMESPACE }}
+        run: |
+          M=""
+          [ -n "$S_USER" ]  || M="$M secret:OCIR_USERNAME"
+          [ -n "$S_TOKEN" ] || M="$M secret:OCIR_AUTH_TOKEN"
+          [ -n "$V_NS" ]    || M="$M variable:OCIR_NAMESPACE"
+          [ -z "$M" ] || { echo "::error::Não cadastrado(s) neste repositório:$M (Settings > Secrets and variables > Actions)"; exit 1; }
+
       - uses: docker/setup-buildx-action@v3
 
       - name: Login no OCIR

@@ -46,6 +46,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Conferir secrets e variables
+        env:
+          S1: ${{ secrets.OCI_CLI_USER }}
+          S2: ${{ secrets.OCI_CLI_TENANCY }}
+          S3: ${{ secrets.OCI_CLI_FINGERPRINT }}
+          S4: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+          S5: ${{ secrets.OCIR_USERNAME }}
+          S6: ${{ secrets.OCIR_AUTH_TOKEN }}
+          V1: ${{ vars.OCIR_NAMESPACE }}
+          V2: ${{ vars.WAR_REPOSITORY_OCID }}
+        run: |
+          M=""
+          [ -n "$S1" ] || M="$M secret:OCI_CLI_USER"
+          [ -n "$S2" ] || M="$M secret:OCI_CLI_TENANCY"
+          [ -n "$S3" ] || M="$M secret:OCI_CLI_FINGERPRINT"
+          [ -n "$S4" ] || M="$M secret:OCI_CLI_KEY_CONTENT"
+          [ -n "$S5" ] || M="$M secret:OCIR_USERNAME"
+          [ -n "$S6" ] || M="$M secret:OCIR_AUTH_TOKEN"
+          [ -n "$V1" ] || M="$M variable:OCIR_NAMESPACE"
+          [ -n "$V2" ] || M="$M variable:WAR_REPOSITORY_OCID"
+          [ -z "$M" ] || { echo "::error::Não cadastrado(s) neste repositório:$M (Settings > Secrets and variables > Actions)"; exit 1; }
+
+
       - name: Resolver versões
         id: v
         run: |
