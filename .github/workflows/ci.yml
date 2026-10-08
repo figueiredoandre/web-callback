@@ -85,12 +85,39 @@ jobs:
       - name: Instalar OCI CLI
         run: pip install --quiet oci-cli
 
-      - name: Baixar WAR do OCI Artifact Registry
+      # Mesmo padrão do backend-cloud: grava ~/.oci/config + chave em arquivo
+      # (mais robusto que OCI_CLI_KEY_CONTENT: preserva quebras de linha da chave).
+      - name: Configurar OCI CLI
         env:
-          OCI_CLI_USER:        ${{ secrets.OCI_CLI_USER }}
-          OCI_CLI_TENANCY:     ${{ secrets.OCI_CLI_TENANCY }}
-          OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
-          OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+          K_USER:  ${{ secrets.OCI_CLI_USER }}
+          K_TEN:   ${{ secrets.OCI_CLI_TENANCY }}
+          K_FP:    ${{ secrets.OCI_CLI_FINGERPRINT }}
+          K_KEY:   ${{ secrets.OCI_CLI_KEY_CONTENT }}
+          K_PASS:  ${{ secrets.OCI_CLI_PASSPHRASE }}   # opcional: só se a chave tiver senha
+        run: |
+          mkdir -p ~/.oci
+          # normaliza: remove \r (colado do Windows) e aceita chave colada com "\n" literais
+          printf '%s\n' "$K_KEY" | sed 's/\r$//' | sed 's/\\n/\n/g' > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          head -n1 ~/.oci/oci_api_key.pem | grep -q -- '-----BEGIN' \
+            || { echo "::error::OCI_CLI_KEY_CONTENT não começa com -----BEGIN ... (cole a chave PEM inteira)"; exit 1; }
+          if grep -q 'ENCRYPTED' ~/.oci/oci_api_key.pem && [ -z "$K_PASS" ]; then
+            echo "::error::A chave privada tem senha. Cadastre o secret OCI_CLI_PASSPHRASE (valor de pass_phrase do seu ~/.oci/config)"; exit 1
+          fi
+          {
+            echo "[DEFAULT]"
+            echo "user=$K_USER"
+            echo "fingerprint=$K_FP"
+            echo "tenancy=$K_TEN"
+            echo "region=${OCI_CLI_REGION}"
+            echo "key_file=$HOME/.oci/oci_api_key.pem"
+            if [ -n "$K_PASS" ]; then echo "pass_phrase=$K_PASS"; fi
+          } > ~/.oci/config
+          chmod 600 ~/.oci/config
+          # teste de autenticação (falha aqui = credencial; falha depois = permissão/artefato)
+          oci os ns get --query data --raw-output
+
+      - name: Baixar WAR do OCI Artifact Registry
         run: |
           mkdir -p artifacts
           oci artifacts generic artifact download-by-path \
